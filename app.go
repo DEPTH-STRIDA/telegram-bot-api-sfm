@@ -102,7 +102,7 @@ func (b *Bot) SetUpdateHandler(handler HandlerFunc) error {
 	return nil
 }
 
-// Start запускает обработку обновлений
+// Start запускает обработку обновлений в горутине
 func (b *Bot) Start(offset, timeout int) {
 	if !b.mu.TryLock() {
 		b.logger.Warn().Msg("Бот уже запущен")
