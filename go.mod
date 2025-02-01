@@ -1,4 +1,4 @@
-module github.com/DEPTH-STRIDA/telegram-bot-api-sfm
+module github.com/depth-strida/telegram-bot-api-sfm
 
 go 1.21
 
