@@ -2,6 +2,7 @@ package tgbotapisfm
 
 import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"go.uber.org/zap"
 )
 
 func (b *Bot) SendDeleteMessage(msg tgbotapi.DeleteMessageConfig) (*tgbotapi.APIResponse, error) {
@@ -31,11 +32,11 @@ func (b *Bot) SendMessageRepet(msg tgbotapi.MessageConfig, numberRepetion int) (
 	for i := 0; i < numberRepetion; i++ {
 		sendedMsg, err := b.SendMessage(msg)
 		if err != nil {
-			b.logger.Info().
-				Int("attempt", i+1).
-				Int("max_attempts", numberRepetion).
-				Err(err).
-				Msg("Ошибка при отправке сообщения с повтором")
+			b.logger.Info("Ошибка при отправке сообщения с повтором",
+				zap.Int("attempt", i+1),
+				zap.Int("max_attempts", numberRepetion),
+				zap.Error(err),
+			)
 			continue
 		}
 		return sendedMsg, nil
@@ -95,10 +96,10 @@ func (b *Bot) EditMessageRepet(editMsg tgbotapi.EditMessageTextConfig, numberRep
 	for i := 0; i < numberRepetion; i++ {
 		response, err = b.EditMessage(editMsg)
 		if err != nil {
-			b.logger.Info().
-				Int("attempt", i).
-				Err(err).
-				Msg("Ошибка при редактировании сообщения с повтором")
+			b.logger.Info("Ошибка при редактировании сообщения с повтором",
+				zap.Int("attempt", i),
+				zap.Error(err),
+			)
 		} else {
 			return response, nil
 		}
@@ -123,10 +124,10 @@ func (b *Bot) DeleteMessageRepet(msgToDelete tgbotapi.DeleteMessageConfig, numbe
 	for i := 0; i < numberRepetion; i++ {
 		err = b.DeleteMessage(msgToDelete)
 		if err != nil {
-			b.logger.Info().
-				Int("attempt", i).
-				Err(err).
-				Msg("Не удалось удалить сообщение из чата")
+			b.logger.Info("Не удалось удалить сообщение из чата",
+				zap.Int("attempt", i),
+				zap.Error(err),
+			)
 		} else {
 			return nil
 		}

@@ -1,7 +1,6 @@
 package tgbotapisfm
 
 import (
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -9,8 +8,32 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	gocache "github.com/patrickmn/go-cache"
-	"github.com/rs/zerolog"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
+
+// NewZapLogger создает новый асинхронный JSON-логгер с настроенным форматированием временных меток,
+// уровней логирования и информации о вызовах.
+func NewZapLogger() (*zap.Logger, error) {
+	config := zap.NewProductionConfig()
+	config.Encoding = "json"
+	config.OutputPaths = []string{"stdout"}
+	config.EncoderConfig = zapcore.EncoderConfig{
+		TimeKey:        "timestamp",
+		LevelKey:       "level",
+		NameKey:        "logger",
+		CallerKey:      "caller",
+		MessageKey:     "msg",
+		StacktraceKey:  "stacktrace",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.LowercaseLevelEncoder,
+		EncodeTime:     zapcore.ISO8601TimeEncoder,
+		EncodeDuration: zapcore.SecondsDurationEncoder,
+		EncodeCaller:   zapcore.ShortCallerEncoder,
+	}
+
+	return config.Build(zap.AddCallerSkip(1))
+}
 
 // Config структура для конфигурации бота
 type Config struct {
@@ -26,7 +49,7 @@ type Bot struct {
 	expiration    time.Duration    // Время хранения состояний пользователя
 	limiter       *Limiter         // Лимитер для ограничения количества запросов к API
 	cache         *gocache.Cache   // Кеш для хранения состояний пользователей
-	logger        *zerolog.Logger  // Логгер для записи событий
+	logger        *zap.Logger      // Логгер для записи событий
 	states        map[string]State // Состояния пользователя
 	globalStates  []*State         // Состояния, в которые может перейти пользователь из любого другоо
 	updateHandler HandlerFunc      // Обработчик, который будет вызываться при получении любого обновления
@@ -34,7 +57,8 @@ type Bot struct {
 }
 
 // NewBot конструктор нового бота
-func NewBot(config Config) (*Bot, error) {
+// logger - необяхательный параметр, если не передан, то будет создан новый логгер
+func NewBot(config Config, logger ...*zap.Logger) (*Bot, error) {
 	// Если карта состояний пуста, то нужно ее иницилизировать, чтобы избежать ошибок
 	if config.States == nil {
 		config.States = make(map[string]State)
@@ -49,9 +73,6 @@ func NewBot(config Config) (*Bot, error) {
 		return nil, ErrInvalidToken
 	}
 
-	// Создаем логгер по умолчанию
-	l := zerolog.New(os.Stdout).With().Timestamp().Logger()
-
 	botAPI, err := tgbotapi.NewBotAPI(config.Token)
 	if err != nil {
 		return nil, NewValidationError(ErrTelegramInit, err)
@@ -65,6 +86,12 @@ func NewBot(config Config) (*Bot, error) {
 		}
 	}
 
+	var zapLogger *zap.Logger
+	if len(logger) > 0 {
+		zapLogger = logger[0]
+	} else {
+		zapLogger, err = NewZapLogger()
+	}
 	app := Bot{
 		BotAPI:       botAPI,
 		limiter:      NewLimiter(),
@@ -72,7 +99,7 @@ func NewBot(config Config) (*Bot, error) {
 		states:       config.States,
 		globalStates: globalStates,
 		expiration:   config.Expiration,
-		logger:       &l,
+		logger:       zapLogger,
 	}
 
 	return &app, nil
@@ -80,7 +107,7 @@ func NewBot(config Config) (*Bot, error) {
 
 // SetLogger заменяет текущий логгер
 // Должен вызываться до Start()
-func (b *Bot) SetLogger(logger *zerolog.Logger) error {
+func (b *Bot) SetLogger(logger *zap.Logger) error {
 	if !b.mu.TryRLock() {
 		return NewValidationError(ErrBotStarted, "logger")
 	}
@@ -105,10 +132,10 @@ func (b *Bot) SetUpdateHandler(handler HandlerFunc) error {
 // Start запускает обработку обновлений в горутине
 func (b *Bot) Start(offset, timeout int) {
 	if !b.mu.TryLock() {
-		b.logger.Warn().Msg("Бот уже запущен")
+		b.logger.Warn("Бот уже запущен")
 		return
 	}
-	b.logger.Info().Msg("Запуск бота")
+	b.logger.Info("Запуск бота")
 	go b.HandleUpdates(offset, timeout)
 }
 
@@ -116,7 +143,7 @@ func (b *Bot) Start(offset, timeout int) {
 func (b *Bot) Stop() {
 	b.mu.Unlock()                   // Разблокируем мьютекс, заблокированный в Start()
 	b.BotAPI.StopReceivingUpdates() // Останавливаем получение обновлений
-	b.logger.Info().Msg("Остановка обработки обновлений")
+	b.logger.Info("Остановка обработки обновлений")
 }
 
 // HandleUpdates запускает обработку всех обновлений поступающих боту из телеграмма
@@ -125,7 +152,7 @@ func (app *Bot) HandleUpdates(offset, timeout int) {
 	u := tgbotapi.NewUpdate(offset)
 	u.Timeout = timeout
 	updates := app.BotAPI.GetUpdatesChan(u)
-	app.logger.Info().Msg("Запуск обработки обновлений")
+	app.logger.Info("Запуск обработки обновлений")
 	for update := range updates {
 
 		// Обработка любого обновления
@@ -145,7 +172,7 @@ func (app *Bot) HandleUpdates(offset, timeout int) {
 			// Обработка глобальных стейтов
 			globalStateFound, err := app.HandleGlobalStates(update)
 			if err != nil {
-				app.logger.Error().Err(err).Msg("failed to handle global state")
+				app.logger.Error("failed to handle global state", zap.Error(err))
 			}
 			// Если глобальное состояние найдено, то выходим из функции
 			if globalStateFound {
@@ -159,12 +186,12 @@ func (app *Bot) HandleUpdates(offset, timeout int) {
 			// Получени состояния
 			userState, ok := app.states[userStateName]
 			if !ok {
-				app.logger.Error().Str("state", userStateName).Msg("state not found in states map")
+				app.logger.Error("state not found in states map", zap.String("state", userStateName))
 			}
 			// Обработка обновления по локальному состоянию
 			_, err = app.SelectHandler(update, &userState)
 			if err != nil {
-				app.logger.Error().Err(err).Msg("failed to handle user state")
+				app.logger.Error("failed to handle user state", zap.Error(err))
 			}
 
 		}(update)
@@ -208,20 +235,14 @@ func (app *Bot) SetUserStateImmediate(userId int64, state string, update tgbotap
 		// Вызываем действие при входе, если оно есть и это не глобальное состояние
 		if newState.AtEntranceFunc != nil {
 			if err := newState.AtEntranceFunc.Handle(app, update); err != nil {
-				app.logger.Error().
-					Err(err).
-					Str("state", state).
-					Msg("failed to handle entrance function")
+				app.logger.Error("failed to handle entrance function", zap.Error(err))
 			}
 		}
 
 		// Немедленная обработка текущего обновления
 		_, err := app.SelectHandler(update, &newState)
 		if err != nil {
-			app.logger.Error().
-				Err(err).
-				Str("state", state).
-				Msg("failed to handle immediate reaction")
+			app.logger.Error("failed to handle immediate reaction", zap.Error(err))
 		}
 	}
 
@@ -238,7 +259,7 @@ func (app *Bot) HandleGlobalStates(update tgbotapi.Update) (bool, error) {
 		handlerIsFound, err := app.SelectHandler(update, state)
 		// Если ошибка, то пропускаем состояние
 		if err != nil {
-			app.logger.Error().Err(err).Msg("failed to handle global state")
+			app.logger.Error("failed to handle global state", zap.Error(err))
 			continue
 		}
 		// Если обработчик найден, то возвращаем true
@@ -255,22 +276,22 @@ func (app *Bot) SelectHandler(update tgbotapi.Update, userState *State) (bool, e
 		if userState.MessageHandlers != nil {
 			return app.handleMessage(userState, update)
 		} else {
-			app.logger.Info().
-				Str("command", update.Message.Text).
-				Int64("chat_id", update.Message.Chat.ID).
-				Str("username", update.Message.Chat.UserName).
-				Msg("command not found")
+			app.logger.Info("command not found",
+				zap.String("command", update.Message.Text),
+				zap.Int64("chat_id", update.Message.Chat.ID),
+				zap.String("username", update.Message.Chat.UserName),
+			)
 			return false, nil
 		}
 	case update.CallbackQuery != nil:
 		if userState.CallbackHandlers != nil {
 			return app.handleCallback(userState, update)
 		} else {
-			app.logger.Info().
-				Str("callback", update.CallbackQuery.Data).
-				Int64("user_id", update.CallbackQuery.From.ID).
-				Str("username", update.CallbackQuery.From.UserName).
-				Msg("callback not found")
+			app.logger.Info("callback not found",
+				zap.String("callback", update.CallbackQuery.Data),
+				zap.Int64("user_id", update.CallbackQuery.From.ID),
+				zap.String("username", update.CallbackQuery.From.UserName),
+			)
 			return false, nil
 		}
 	}
@@ -285,36 +306,26 @@ func (app *Bot) handleMessage(userState *State, update tgbotapi.Update) (bool, e
 	if currentAction, ok := userState.MessageHandlers[strings.ToLower(strings.TrimSpace(update.Message.Text))]; ok {
 		messageFound = true
 		if err := currentAction.Handle(app, update); err != nil {
-			app.logger.Error().
-				Err(err).
-				Str("command", update.Message.Text).
-				Int64("chat_id", update.Message.Chat.ID).
-				Str("username", update.Message.Chat.UserName).
-				Msg("failed to handle command")
+			app.logger.Error("failed to handle command", zap.Error(err))
 		} else {
-			app.logger.Info().
-				Str("command", update.Message.Text).
-				Int64("chat_id", update.Message.Chat.ID).
-				Str("username", update.Message.Chat.UserName).
-				Msg("command handled successfully")
+			app.logger.Info("command handled successfully",
+				zap.String("command", update.Message.Text),
+				zap.Int64("chat_id", update.Message.Chat.ID),
+				zap.String("username", update.Message.Chat.UserName),
+			)
 		}
 	} else {
 		if userState.CatchAllFunc != nil {
 			err := userState.CatchAllFunc.Handle(app, update)
 			if err != nil {
-				app.logger.Error().
-					Err(err).
-					Int64("chat_id", update.Message.Chat.ID).
-					Str("username", update.Message.Chat.UserName).
-					Str("command", update.Message.Text).
-					Msg("failed to handle command")
+				app.logger.Error("failed to handle command", zap.Error(err))
 			}
 		} else {
-			app.logger.Info().
-				Int64("chat_id", update.Message.Chat.ID).
-				Str("username", update.Message.Chat.UserName).
-				Str("command", update.Message.Text).
-				Msg("command not found")
+			app.logger.Info("command not found",
+				zap.String("command", update.Message.Text),
+				zap.Int64("chat_id", update.Message.Chat.ID),
+				zap.String("username", update.Message.Chat.UserName),
+			)
 		}
 
 	}
@@ -328,38 +339,27 @@ func (app *Bot) handleCallback(userState *State, update tgbotapi.Update) (bool, 
 	if currentAction, ok := userState.CallbackHandlers[update.CallbackQuery.Data]; ok {
 		callbackFound = true
 		if err := currentAction.Handle(app, update); err != nil {
-			app.logger.Error().
-				Err(err).
-				Str("callback", update.CallbackQuery.Data).
-				Int64("user_id", update.CallbackQuery.From.ID).
-				Str("username", update.CallbackQuery.From.UserName).
-				Msg("failed to handle callback")
+			app.logger.Error("failed to handle callback", zap.Error(err))
 			return callbackFound, err
 		}
 
-		app.logger.Info().
-			Str("callback", update.CallbackQuery.Data).
-			Int64("user_id", update.CallbackQuery.From.ID).
-			Str("username", update.CallbackQuery.From.UserName).
-			Msg("callback handled successfully")
+		app.logger.Info("callback handled successfully",
+			zap.String("callback", update.CallbackQuery.Data),
+			zap.Int64("user_id", update.CallbackQuery.From.ID),
+			zap.String("username", update.CallbackQuery.From.UserName),
+		)
 	} else {
 		if userState.CatchAllFunc != nil {
 			err := userState.CatchAllFunc.Handle(app, update)
 			if err != nil {
-				app.logger.Error().
-					Err(err).
-					Int64("user_id", update.CallbackQuery.From.ID).
-					Str("username", update.CallbackQuery.From.UserName).
-					Str("callback", update.CallbackQuery.Data).
-					Msg("failed to handle callback")
-				return callbackFound, err
+				app.logger.Error("failed to handle callback", zap.Error(err))
 			}
 		} else {
-			app.logger.Info().
-				Int64("user_id", update.CallbackQuery.From.ID).
-				Str("username", update.CallbackQuery.From.UserName).
-				Str("callback", update.CallbackQuery.Data).
-				Msg("callback not found")
+			app.logger.Info("callback not found",
+				zap.Int64("user_id", update.CallbackQuery.From.ID),
+				zap.String("username", update.CallbackQuery.From.UserName),
+				zap.String("callback", update.CallbackQuery.Data),
+			)
 		}
 	}
 	return callbackFound, nil
