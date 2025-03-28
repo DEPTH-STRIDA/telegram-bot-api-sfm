@@ -4,7 +4,7 @@
 
 - 🔄 FSM (Finite State Machine) - для управления состояниями диалогов
 - 🚦  Rate Limiter - ограничитель для соблюденя лимитов Telegram API
-- 🔍 Логирование через zerolog
+- 🔍 Логирование через zap logger
 
 ## 🚀 Установка
 
