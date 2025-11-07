@@ -1,4 +1,4 @@
-package tgbotapisfm
+package tgfsm
 
 import (
 	"strconv"
@@ -9,186 +9,286 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	gocache "github.com/patrickmn/go-cache"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
-// NewZapLogger создает новый асинхронный JSON-логгер с настроенным форматированием временных меток,
-// уровней логирования и информации о вызовах.
-func NewZapLogger() (*zap.Logger, error) {
-	config := zap.NewProductionConfig()
-	config.Encoding = "json"
-	config.OutputPaths = []string{"stdout"}
-	config.EncoderConfig = zapcore.EncoderConfig{
-		TimeKey:        "timestamp",
-		LevelKey:       "level",
-		NameKey:        "logger",
-		CallerKey:      "caller",
-		MessageKey:     "msg",
-		StacktraceKey:  "stacktrace",
-		LineEnding:     zapcore.DefaultLineEnding,
-		EncodeLevel:    zapcore.LowercaseLevelEncoder,
-		EncodeTime:     zapcore.ISO8601TimeEncoder,
-		EncodeDuration: zapcore.SecondsDurationEncoder,
-		EncodeCaller:   zapcore.ShortCallerEncoder,
-	}
+const (
+	// Default values
+	DefaultExpiration      = 24 * time.Hour // Default user state storage duration
+	DefaultCleanupInterval = 1 * time.Hour  // Default cache cleanup interval
+)
 
-	return config.Build(zap.AddCallerSkip(1))
-}
-
-// Config структура для конфигурации бота
-type Config struct {
-	Token           string           // Токен бота
-	Expiration      time.Duration    // Время хранения состояний пользователя
-	CleanupInterval time.Duration    // Интервал очистки кеша
-	States          map[string]State // Карта состояний
-}
-
-// Bot структура для бота
+// Bot represents the bot instance
 type Bot struct {
-	BotAPI        *tgbotapi.BotAPI // API бота. Экспортируется для доступа к нему из вне
-	expiration    time.Duration    // Время хранения состояний пользователя
-	limiter       *Limiter         // Лимитер для ограничения количества запросов к API
-	cache         *gocache.Cache   // Кеш для хранения состояний пользователей
-	logger        *zap.Logger      // Логгер для записи событий
-	states        map[string]State // Состояния пользователя
-	globalStates  []*State         // Состояния, в которые может перейти пользователь из любого другоо
-	updateHandler HandlerFunc      // Обработчик, который будет вызываться при получении любого обновления
-	mu            sync.RWMutex     // Мьютекс для проверки состояния бота
+	BotAPI            *tgbotapi.BotAPI // Bot API. Exported for external access
+	expiration        time.Duration    // User state storage duration
+	cleanupInterval   time.Duration    // Cache cleanup interval
+	limiter           *Limiter         // Limiter for API request rate limiting
+	cache             *gocache.Cache   // Cache for storing user states
+	logger            *zap.Logger      // Logger for recording events
+	states            map[string]State // User states
+	globalStates      []*State         // States that user can transition to from any other state
+	updateHandler     HandlerFunc      // Handler that will be called when receiving any update
+	privateOnly       bool             // Only accept messages from private chats
+	blacklistedChats  map[int64]bool   // Blacklisted chat IDs
+	mu                sync.RWMutex     // Mutex for bot state (start/stop/update)
+	blacklistMu       sync.RWMutex     // Mutex for blacklist operations
+	autoDeleteEnabled bool             // Enable auto-deletion of last message
+	lastMessageCache  LastMessageCache // Cache for last message IDs
 }
 
-// NewBot конструктор нового бота
-// logger - необяхательный параметр, если не передан, то будет создан новый логгер
-func NewBot(config Config, logger ...*zap.Logger) (*Bot, error) {
-	// Если карта состояний пуста, то нужно ее иницилизировать, чтобы избежать ошибок
-	if config.States == nil {
-		config.States = make(map[string]State)
-	}
-	if config.Expiration < 0 {
-		return nil, NewValidationError(ErrNegativeExpiration, config.Expiration)
-	}
-	if config.CleanupInterval < 0 {
-		return nil, NewValidationError(ErrNegativeCleanup, config.CleanupInterval)
-	}
-	if config.Token == "" {
+// NewBot creates a new bot instance
+func NewBot(token string, options ...Option) (*Bot, error) {
+	// Validate token first
+	if token == "" {
 		return nil, ErrInvalidToken
 	}
 
-	botAPI, err := tgbotapi.NewBotAPI(config.Token)
-	if err != nil {
-		return nil, NewValidationError(ErrTelegramInit, err)
+	// Initialize bot with default values
+	app := Bot{
+		limiter: NewLimiter(),
 	}
 
-	// Дополнительная map'a глобальных состояний
+	// Apply options
+	for _, option := range options {
+		option(&app)
+	}
+
+	// Set default values if not provided by options
+	if err := app.setDefaults(); err != nil {
+		return nil, err
+	}
+
+	// Validate configured values
+	if app.expiration < 0 {
+		return nil, NewSFMError(ErrNegativeExpiration, app.expiration)
+	}
+	if app.cleanupInterval < 0 {
+		return nil, NewSFMError(ErrNegativeCleanup, app.cleanupInterval)
+	}
+
+	// Initialize Telegram Bot API
+	botAPI, err := tgbotapi.NewBotAPI(token)
+	if err != nil {
+		return nil, NewSFMError(ErrTelegramInit, err)
+	}
+	app.BotAPI = botAPI
+
+	// Initialize cache with configured values
+	app.cache = gocache.New(app.expiration, app.cleanupInterval)
+
+	// Build global states map
 	globalStates := make([]*State, 0)
-	for _, state := range config.States {
+	for _, state := range app.states {
 		if state.Global {
 			globalStates = append(globalStates, &state)
 		}
 	}
-
-	var zapLogger *zap.Logger
-	if len(logger) > 0 {
-		zapLogger = logger[0]
-	} else {
-		zapLogger, err = NewZapLogger()
-	}
-	app := Bot{
-		BotAPI:       botAPI,
-		limiter:      NewLimiter(),
-		cache:        gocache.New(config.Expiration, config.CleanupInterval),
-		states:       config.States,
-		globalStates: globalStates,
-		expiration:   config.Expiration,
-		logger:       zapLogger,
-	}
+	app.globalStates = globalStates
 
 	return &app, nil
 }
 
-// SetLogger заменяет текущий логгер
-// Должен вызываться до Start()
-func (b *Bot) SetLogger(logger *zap.Logger) error {
-	if !b.mu.TryRLock() {
-		return NewValidationError(ErrBotStarted, "logger")
+// setDefaults sets default values for unconfigured fields
+func (b *Bot) setDefaults() error {
+	if b.expiration == 0 {
+		b.expiration = DefaultExpiration
 	}
-	defer b.mu.RUnlock()
+	if b.cleanupInterval == 0 {
+		b.cleanupInterval = DefaultCleanupInterval
+	}
+	if b.states == nil {
+		b.states = make(map[string]State)
+	}
+	if b.blacklistedChats == nil {
+		b.blacklistedChats = make(map[int64]bool)
+	}
+	if b.logger == nil {
+		logger, err := NewZapLogger()
+		if err != nil {
+			return NewSFMError(ErrTelegramInit, err)
+		}
+		b.logger = logger
+	}
 
-	b.logger = logger
 	return nil
 }
 
-// SetUpdateHandler устанавливает обработчик обновлений
-// Должен вызываться до Start()
-func (b *Bot) SetUpdateHandler(handler HandlerFunc) error {
-	if !b.mu.TryRLock() {
-		return NewValidationError(ErrBotStarted, "update handler")
+// UpdateBot updates bot configuration with new options
+// Can only be called when bot is not running
+func (b *Bot) UpdateBot(options ...Option) error {
+	// Try to acquire write lock - this will fail if bot is running
+	if !b.mu.TryLock() {
+		return NewSFMError(ErrBotStarted, "cannot update running bot")
 	}
-	defer b.mu.RUnlock()
+	defer b.mu.Unlock()
 
-	b.updateHandler = handler
+	// Apply new options
+	for _, option := range options {
+		option(b)
+	}
+
+	// Set defaults for any unset values
+	if err := b.setDefaults(); err != nil {
+		return err
+	}
+
+	// Validate configured values
+	if b.expiration < 0 {
+		return NewSFMError(ErrNegativeExpiration, b.expiration)
+	}
+	if b.cleanupInterval < 0 {
+		return NewSFMError(ErrNegativeCleanup, b.cleanupInterval)
+	}
+
+	// Reinitialize cache with new values
+	b.cache = gocache.New(b.expiration, b.cleanupInterval)
+
+	// Rebuild global states map
+	globalStates := make([]*State, 0)
+	for _, state := range b.states {
+		if state.Global {
+			globalStates = append(globalStates, &state)
+		}
+	}
+	b.globalStates = globalStates
+
 	return nil
 }
 
-// Start запускает обработку обновлений в горутине
+// AddToBlacklist adds a chat ID to the blacklist
+// Can be called while bot is running (uses blacklistMu)
+func (b *Bot) AddToBlacklist(chatID int64) {
+	b.blacklistMu.Lock()
+	defer b.blacklistMu.Unlock()
+	b.blacklistedChats[chatID] = true
+}
+
+// RemoveFromBlacklist removes a chat ID from the blacklist
+// Can be called while bot is running (uses blacklistMu)
+func (b *Bot) RemoveFromBlacklist(chatID int64) {
+	b.blacklistMu.Lock()
+	defer b.blacklistMu.Unlock()
+	delete(b.blacklistedChats, chatID)
+}
+
+// IsBlacklisted checks if a chat ID is blacklisted
+// Can be called while bot is running (uses blacklistMu)
+func (b *Bot) IsBlacklisted(chatID int64) bool {
+	b.blacklistMu.RLock()
+	defer b.blacklistMu.RUnlock()
+	return b.blacklistedChats[chatID]
+}
+
+// GetBlacklist returns a copy of the current blacklist
+// Can be called while bot is running (uses blacklistMu)
+func (b *Bot) GetBlacklist() []int64 {
+	b.blacklistMu.RLock()
+	defer b.blacklistMu.RUnlock()
+
+	blacklist := make([]int64, 0, len(b.blacklistedChats))
+	for chatID := range b.blacklistedChats {
+		blacklist = append(blacklist, chatID)
+	}
+	return blacklist
+}
+
+// IsPrivateOnly returns whether bot only accepts private messages
+// Can be called while bot is running (uses main mu)
+func (b *Bot) IsPrivateOnly() bool {
+	return b.privateOnly
+}
+
+// shouldProcessUpdate determines if an update should be processed based on filters
+func (b *Bot) shouldProcessUpdate(update tgbotapi.Update) bool {
+	// Check if update has a chat
+	var chatID int64
+	if update.Message != nil {
+		chatID = update.Message.Chat.ID
+	} else if update.CallbackQuery != nil {
+		chatID = update.CallbackQuery.Message.Chat.ID
+	} else {
+		// No chat information, skip
+		return false
+	}
+
+	// Check if chat is blacklisted (uses blacklistMu)
+	if b.IsBlacklisted(chatID) {
+		return false
+	}
+	// Check if private only mode is enabled (uses main mu)
+	if b.IsPrivateOnly() {
+		// Only process if it's a private chat
+		if update.Message != nil {
+			return update.Message.Chat.Type == "private"
+		} else if update.CallbackQuery != nil {
+			return update.CallbackQuery.Message.Chat.Type == "private"
+		}
+	}
+
+	return true
+}
+
+// Start starts update processing in a goroutine
 func (b *Bot) Start(offset, timeout int) {
 	if !b.mu.TryLock() {
-		b.logger.Warn("Бот уже запущен")
+		b.logger.Warn("Bot is already running")
 		return
 	}
-	b.logger.Info("Запуск бота")
+	b.logger.Info("Starting bot")
 	go b.HandleUpdates(offset, timeout)
+	// Note: mutex remains locked while bot is running
 }
 
-// Stop останавливает обработку обновлений
+// Stop stops update processing
 func (b *Bot) Stop() {
-	b.mu.Unlock()                   // Разблокируем мьютекс, заблокированный в Start()
-	b.BotAPI.StopReceivingUpdates() // Останавливаем получение обновлений
-	b.logger.Info("Остановка обработки обновлений")
+	b.BotAPI.StopReceivingUpdates() // Stop receiving updates
+	b.mu.Unlock()                   // Unlock mutex locked in Start()
+	b.logger.Info("Stopping update processing")
 }
 
-// HandleUpdates запускает обработку всех обновлений поступающих боту из телеграмма
+// HandleUpdates starts processing all updates received by the bot from Telegram
 func (app *Bot) HandleUpdates(offset, timeout int) {
-	// Настройка обновлений
+	// Configure updates
 	u := tgbotapi.NewUpdate(offset)
 	u.Timeout = timeout
 	updates := app.BotAPI.GetUpdatesChan(u)
-	app.logger.Info("Запуск обработки обновлений")
-	for update := range updates {
+	app.logger.Info("Starting update processing")
 
-		// Обработка любого обновления
-		go func() {
+	for update := range updates {
+		// Check if update should be processed based on filters
+		if !app.shouldProcessUpdate(update) {
+			continue
+		}
+		go func(update tgbotapi.Update) {
 			if app.updateHandler != nil {
 				app.updateHandler(app, update)
 			}
-		}()
 
-		go func(update tgbotapi.Update) {
-
-			// Обработка локальных стейтов
+			// Process local states
 			if update.SentFrom() == nil {
 				return
 			}
 
-			// Обработка глобальных стейтов
+			// Process global states
 			globalStateFound, err := app.HandleGlobalStates(update)
 			if err != nil {
 				app.logger.Error("failed to handle global state", zap.Error(err))
 			}
-			// Если глобальное состояние найдено, то выходим из функции
+			// If global state is found, exit the function
 			if globalStateFound {
 				return
 			}
-			// Получение названия состояния пользователя
+			// Get user state name
 			userStateName, err := app.GetUserState(update.SentFrom().ID)
 			if err != nil {
 				return
 			}
-			// Получени состояния
+			// Get state
 			userState, ok := app.states[userStateName]
 			if !ok {
 				app.logger.Error("state not found in states map", zap.String("state", userStateName))
 			}
-			// Обработка обновления по локальному состоянию
+			// Process update by local state
 			_, err = app.SelectHandler(update, &userState)
 			if err != nil {
 				app.logger.Error("failed to handle user state", zap.Error(err))
@@ -199,7 +299,7 @@ func (app *Bot) HandleUpdates(offset, timeout int) {
 	}
 }
 
-// GetUserState возвращает название состояния, в котором находится пользователь
+// GetUserState returns the name of the state the user is currently in
 func (app *Bot) GetUserState(userId int64) (string, error) {
 	userStateInterface, ok := app.cache.Get(strconv.FormatInt(userId, 10))
 	if !ok {
@@ -214,32 +314,33 @@ func (app *Bot) GetUserState(userId int64) (string, error) {
 	return userState, nil
 }
 
-// SetUserState меняет состояние пользователя
+// SetUserState changes the user's state
 func (app *Bot) SetUserState(userId int64, state string) error {
 	_, ok := app.states[state]
 	if !ok {
-		return NewValidationError(ErrStateHandlerNotFound, state)
+		return NewSFMError(ErrStateHandlerNotFound, state)
 	}
 
 	app.cache.Set(strconv.FormatInt(userId, 10), state, app.expiration)
 	return nil
 }
 
-// SetUserStateImmediate меняет состояние пользователя и сразу обрабатывает текущее обновление
+// SetUserStateImmediate changes the user's state and immediately processes the current update
 func (app *Bot) SetUserStateImmediate(userId int64, state string, update tgbotapi.Update) error {
 	if err := app.SetUserState(userId, state); err != nil {
 		return err
 	}
 
 	if newState, ok := app.states[state]; ok {
-		// Вызываем действие при входе, если оно есть и это не глобальное состояние
+		// Call entrance action if it exists and this is not a global state
 		if newState.AtEntranceFunc != nil {
 			if err := newState.AtEntranceFunc.Handle(app, update); err != nil {
 				app.logger.Error("failed to handle entrance function", zap.Error(err))
 			}
+			return nil
 		}
 
-		// Немедленная обработка текущего обновления
+		// Immediate processing of current update
 		_, err := app.SelectHandler(update, &newState)
 		if err != nil {
 			app.logger.Error("failed to handle immediate reaction", zap.Error(err))
@@ -249,20 +350,20 @@ func (app *Bot) SetUserStateImmediate(userId int64, state string, update tgbotap
 	return nil
 }
 
-// HandleGlobalStates проверяет подходит ли действие пользователя под
-// глобальные состояния и если подходит, то выполняет его.
-// Возвращает true, если обработчик нашелся и выполнился.
+// HandleGlobalStates checks if user action matches global states and executes it if it does.
+// Returns true if a handler was found and executed.
 func (app *Bot) HandleGlobalStates(update tgbotapi.Update) (bool, error) {
-	// Обработка всех глобальных состояний
+	// Process all global states
 	for _, state := range app.globalStates {
-		// Обработка состояния
+		// Process state
+
 		handlerIsFound, err := app.SelectHandler(update, state)
-		// Если ошибка, то пропускаем состояние
+		// If error, skip state
 		if err != nil {
 			app.logger.Error("failed to handle global state", zap.Error(err))
 			continue
 		}
-		// Если обработчик найден, то возвращаем true
+		// If handler found, return true
 		if handlerIsFound {
 			return true, nil
 		}
@@ -298,11 +399,11 @@ func (app *Bot) SelectHandler(update tgbotapi.Update, userState *State) (bool, e
 	return false, nil
 }
 
-// handleMessage ищет команду в map'е и выполняет ее
+// handleMessage searches for a command in the map and executes it
 func (app *Bot) handleMessage(userState *State, update tgbotapi.Update) (bool, error) {
 	messageFound := false
 
-	// Поиск обработчика
+	// Search for handler
 	if currentAction, ok := userState.MessageHandlers[strings.ToLower(strings.TrimSpace(update.Message.Text))]; ok {
 		messageFound = true
 		if err := currentAction.Handle(app, update); err != nil {
@@ -332,7 +433,7 @@ func (app *Bot) handleMessage(userState *State, update tgbotapi.Update) (bool, e
 	return messageFound, nil
 }
 
-// handleCallback ищет команду в map'е и выполняет ее
+// handleCallback searches for a command in the map and executes it
 func (app *Bot) handleCallback(userState *State, update tgbotapi.Update) (bool, error) {
 	callbackFound := false
 
@@ -363,4 +464,12 @@ func (app *Bot) handleCallback(userState *State, update tgbotapi.Update) (bool, 
 		}
 	}
 	return callbackFound, nil
+}
+
+func (app *Bot) GetExpiration() time.Duration {
+	return app.expiration
+}
+
+func (app *Bot) GetCache() *gocache.Cache {
+	return app.cache
 }

@@ -1,113 +1,89 @@
-package tgbotapisfm
+package tgfsm
 
 import (
+	"context"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 const (
-	GlobalLimit    = 30          // Максимум запросов в секунду к API
-	ChatLimit      = 1           // Максимум сообщений в секунду в один чат
-	MultiChatLimit = 30          // Максимум сообщений в секунду в разные чаты
-	WaitTime       = time.Second // Ждем полную секунду при превышении лимита
+	// Telegram API limits
+	GlobalMessageLimit = 30 // Maximum messages per second to all chats
+	ChatMessageLimit   = 1  // Maximum messages per second to one chat
+	APILimit           = 30 // Maximum API requests per second
+	BurstSize          = 5  // Burst allowance for rate limiter
 )
 
-// Limiter управляет ограничениями запросов к API
+// Limiter manages rate limiting for Telegram API requests
 type Limiter struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
-	ChatTimes    map[int64]time.Time
-	MessageTimes []time.Time
-	ApiTimes     []time.Time
+	// Global rate limiter for all messages
+	globalLimiter *rate.Limiter
+
+	// Per-chat rate limiters
+	chatLimiters map[int64]*rate.Limiter
+
+	// API rate limiter
+	apiLimiter *rate.Limiter
 }
 
-// NewLimiter создает новый лимитер
+// NewLimiter creates a new rate limiter
 func NewLimiter() *Limiter {
 	return &Limiter{
-		ChatTimes:    make(map[int64]time.Time),
-		MessageTimes: make([]time.Time, 0, MultiChatLimit),
-		ApiTimes:     make([]time.Time, 0, GlobalLimit),
+		globalLimiter: rate.NewLimiter(rate.Every(time.Second/GlobalMessageLimit), BurstSize),
+		chatLimiters:  make(map[int64]*rate.Limiter),
+		apiLimiter:    rate.NewLimiter(rate.Every(time.Second/APILimit), BurstSize),
 	}
 }
 
-// CheckMessage проверяет возможность отправки сообщения в чат
-func (l *Limiter) CheckMessage(chatID int64) {
+// WaitForMessage waits for permission to send a message to a specific chat
+func (l *Limiter) WaitForMessage(ctx context.Context, chatID int64) error {
+	// Wait for global message limit
+	if err := l.globalLimiter.Wait(ctx); err != nil {
+		return err
+	}
+
+	// Wait for per-chat limit
+	chatLimiter := l.getChatLimiter(chatID)
+	return chatLimiter.Wait(ctx)
+}
+
+// WaitForAPI waits for permission to make an API request
+func (l *Limiter) WaitForAPI(ctx context.Context) error {
+	return l.apiLimiter.Wait(ctx)
+}
+
+// getChatLimiter returns or creates a rate limiter for a specific chat
+func (l *Limiter) getChatLimiter(chatID int64) *rate.Limiter {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	now := time.Now()
-
-	// Проверяем ограничение на конкретный чат (1 сообщение в секунду)
-	if lastTime, ok := l.ChatTimes[chatID]; ok {
-		if wait := time.Second - now.Sub(lastTime); wait > 0 {
-			time.Sleep(wait)
-			now = time.Now()
-		}
+	if limiter, exists := l.chatLimiters[chatID]; exists {
+		return limiter
 	}
 
-	l.cleanup(now)
-
-	// Проверяем общее ограничение на сообщения (30 в секунду)
-	if len(l.MessageTimes) >= MultiChatLimit {
-		oldest := l.MessageTimes[0]
-		if wait := time.Second - now.Sub(oldest); wait > 0 {
-			time.Sleep(wait)
-			now = time.Now()
-			l.cleanup(now)
-		}
-	}
-
-	// Проверяем общее ограничение API (30 запросов в секунду)
-	if len(l.ApiTimes) >= GlobalLimit {
-		oldest := l.ApiTimes[0]
-		if wait := time.Second - now.Sub(oldest); wait > 0 {
-			time.Sleep(wait)
-			now = time.Now()
-			l.cleanup(now)
-		}
-	}
-
-	// Отправка сообщения считается и как сообщение, и как запрос к API
-	l.ChatTimes[chatID] = now
-	l.MessageTimes = append(l.MessageTimes, now)
-	l.ApiTimes = append(l.ApiTimes, now)
+	// Create new limiter for this chat (1 message per second)
+	limiter := rate.NewLimiter(rate.Every(time.Second/ChatMessageLimit), 1)
+	l.chatLimiters[chatID] = limiter
+	return limiter
 }
 
-// CheckAPI проверяет возможность отправки запроса к API
-func (l *Limiter) CheckAPI() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	now := time.Now()
-	l.cleanup(now)
-
-	if len(l.ApiTimes) >= GlobalLimit {
-		oldest := l.ApiTimes[0]
-		if wait := time.Second - now.Sub(oldest); wait > 0 {
-			time.Sleep(wait) // Ждем только до истечения самого старого запроса
-			now = time.Now()
-			l.cleanup(now)
-		}
+// AllowMessage checks if a message can be sent without waiting
+func (l *Limiter) AllowMessage(chatID int64) bool {
+	// Check global limit
+	if !l.globalLimiter.Allow() {
+		return false
 	}
 
-	l.ApiTimes = append(l.ApiTimes, now)
+	// Check per-chat limit
+	chatLimiter := l.getChatLimiter(chatID)
+	return chatLimiter.Allow()
 }
 
-// cleanup удаляет записи старше 1 секунды
-func (l *Limiter) cleanup(now time.Time) {
-	newMessageTimes := l.MessageTimes[:0]
-	for _, t := range l.MessageTimes {
-		if now.Sub(t) < time.Second {
-			newMessageTimes = append(newMessageTimes, t)
-		}
-	}
-	l.MessageTimes = newMessageTimes
-
-	newAPITimes := l.ApiTimes[:0]
-	for _, t := range l.ApiTimes {
-		if now.Sub(t) < time.Second {
-			newAPITimes = append(newAPITimes, t)
-		}
-	}
-	l.ApiTimes = newAPITimes
+// AllowAPI checks if an API request can be made without waiting
+func (l *Limiter) AllowAPI() bool {
+	return l.apiLimiter.Allow()
 }
